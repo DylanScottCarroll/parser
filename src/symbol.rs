@@ -23,10 +23,18 @@ impl Symbol {
         symbol_type: SymbolType::Epsilon,
         id: 1,
     };
+
+    pub fn is_terrminal(&self) -> bool {
+        self.symbol_type == SymbolType::Terminal
+    }
+
+    pub fn is_nonterrminal(&self) -> bool {
+        self.symbol_type == SymbolType::Nonterminal
+    }
 }
 
 pub struct SymbolDomain {
-    count: usize,
+    len: usize,
     symbols: Vec<Symbol>,
     names: Vec<String>,
     by_name: HashMap<String, u32>,
@@ -39,11 +47,11 @@ impl SymbolDomain {
     const START_ID: u32 = 2;
 
     pub fn new(symbols: Vec<(String, SymbolType)>) -> SymbolDomain {
-        let count: usize = symbols.len() + Self::START_ID as usize;
+        let len: usize = symbols.len() + Self::START_ID as usize;
 
-        let capacity = count as usize;
+        let capacity = len as usize;
         let mut domain = SymbolDomain {
-            count,
+            len,
             symbols: Vec::with_capacity(capacity),
             names: Vec::with_capacity(capacity),
             by_name: HashMap::with_capacity(capacity),
@@ -88,8 +96,8 @@ impl SymbolDomain {
         self.by_name.insert(name, id);
     }
 
-    pub fn count(&self) -> usize {
-        self.count
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn symbol_name(&self, symbol: Symbol) -> String {
@@ -102,164 +110,227 @@ impl SymbolDomain {
             .and_then(|&i| self.symbols.get(i as usize))
             .map(|s| *s)
     }
-}
 
-impl IntoIterator for SymbolDomain {
-    type Item = Symbol;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    pub fn terminals(&self) -> Vec<Symbol> {
+        self.iter().filter(|s| s.is_terrminal()).collect()
+    }
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.symbols.into_iter()
+    pub fn nonterminals(&self) -> Vec<Symbol> {
+        self.iter().filter(|s| s.is_nonterrminal()).collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Symbol> {
+        (0..self.len)
+            .map(|i| self.symbols.get(i))
+            .flatten()
+            .cloned()
     }
 }
 
 #[derive(Clone)]
-pub struct SymbolSet {
-    bits: Vec<u64>,
-    len: usize,
-    domain_size: usize,
+enum SymbolSetStore {
+    Inline([u64; 4]),
+    Heap(Vec<u64>),
 }
 
+use SymbolSetStore::{Heap, Inline};
+impl SymbolSetStore {
+    const WORD_SIZE: usize = 64;
+    const INLINE_WORDS: usize = 4;
+    const INLINE_BITS: usize = SymbolSetStore::WORD_SIZE * SymbolSetStore::INLINE_WORDS;
+
+    fn inline() -> SymbolSetStore {
+        Inline([0; SymbolSetStore::INLINE_WORDS])
+    }
+
+    fn heap(words: usize) -> SymbolSetStore {
+        Heap(vec![0; words])
+    }
+
+    fn word(&self, word: usize) -> u64 {
+        if word >= self.words() {
+            0
+        } else {
+            match self {
+                Inline(arr) => arr[word],
+                Heap(vec) => vec[word],
+            }
+        }
+    }
+
+    fn word_mut(&mut self, word: usize) -> &mut u64 {
+        match self {
+            Inline(arr) => &mut arr[word],
+            Heap(vec) => &mut vec[word],
+        }
+    }
+
+    fn words(&self) -> usize {
+        match self {
+            Inline(_) => SymbolSetStore::INLINE_WORDS,
+            Heap(vec) => vec.len(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SymbolSet(SymbolSetStore);
+
 impl SymbolSet {
-    pub fn new(domain_size: usize) -> SymbolSet {
-        let num_buckers: usize = domain_size.div_ceil(64);
-        SymbolSet {
-            bits: Vec::with_capacity(num_buckers),
-            len: 0,
-            domain_size,
+    pub fn new() -> SymbolSet {
+        SymbolSet(SymbolSetStore::inline())
+    }
+
+    pub fn with_capacity(capacity: usize) -> SymbolSet {
+        if capacity <= SymbolSetStore::INLINE_BITS {
+            Self::new()
+        } else {
+            SymbolSet(SymbolSetStore::heap(capacity.div_ceil(64)))
+        }
+    }
+
+    fn matching_capacity(&self) -> SymbolSet {
+        match &self.0 {
+            Inline(_) => Self::new(),
+            Heap(vec) => SymbolSet(SymbolSetStore::heap(vec.len())),
         }
     }
 
     fn bit_index(id: u32) -> (usize, usize) {
-        let bucket = (id / 64) as usize;
-        let offset = id as usize - (bucket * 64);
+        let i = id as usize;
+        let word = i / SymbolSetStore::WORD_SIZE;
+        let offset = i - (word * SymbolSetStore::WORD_SIZE);
 
-        (bucket, offset)
+        (word, offset)
     }
 
-    pub fn len(&self) -> usize {
-        self.len
+    fn grow(&mut self, words: usize) {
+        if words > self.0.words() {
+            match &mut self.0 {
+                Inline(arr) => {
+                    let mut vec = Vec::from(arr.as_slice());
+                    let extra = words - vec.len();
+                    vec.extend(std::iter::repeat(0).take(extra));
+                    self.0 = SymbolSetStore::Heap(vec);
+                }
+                Heap(vec) => {
+                    let extra = words - vec.len();
+                    vec.extend(std::iter::repeat(0).take(extra));
+                }
+            }
+        }
     }
 
     pub fn clear(&mut self) {
-        for i in 0..self.bits.len() {
-            self.bits[i] = 0;
+        match &mut self.0 {
+            Inline(arr) => arr.fill(0),
+            Heap(vec) => vec.fill(0),
         }
     }
 
     pub fn insert(&mut self, symbol: Symbol) {
-        self.insert_id(symbol.id);
-    }
-
-    pub fn insert_id(&mut self, id: u32) {
-        let (bucket, offset) = SymbolSet::bit_index(id);
-        self.bits[bucket] |= 1 << offset;
+        let (word, offset) = SymbolSet::bit_index(symbol.id);
+        *self.0.word_mut(word) |= 1 << offset;
     }
 
     pub fn remove(&mut self, symbol: Symbol) {
-        self.remove_id(symbol.id)
+        let (word, offset) = SymbolSet::bit_index(symbol.id);
+        *self.0.word_mut(word) &= !(1 << offset);
     }
 
-    fn remove_id(&mut self, id: u32) {
-        let (bucket, offset) = SymbolSet::bit_index(id);
-        self.bits[bucket] &= !(1 << offset);
-    }
-
-    fn contains_id(&self, id: u32) -> bool {
-        let (bucket, offset) = SymbolSet::bit_index(id);
-        self.bits[bucket] & (1 << offset) == 1
+    pub fn extend(&mut self, other: &SymbolSet) {
+        self.grow(other.0.words());
+        let words = usize::min(self.0.words(), other.0.words());
+        for i in 0..words {
+            *self.0.word_mut(i) |= other.0.word(i);
+        }
     }
 
     pub fn contains(&self, symbol: Symbol) -> bool {
         self.contains_id(symbol.id)
     }
 
+    fn contains_id(&self, id: u32) -> bool {
+        let (bucket, offset) = SymbolSet::bit_index(id);
+        self.0.word(bucket) & (1 << offset) != 0
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        for i in 0..self.0.words() {
+            if self.0.word(i) != 0 {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn difference(&self, other: &SymbolSet) -> SymbolSet {
-        // assert_eq!(self.domain, other.domain);
-
-        let mut new_set = SymbolSet::new(self.domain_size);
-        for i in 0..new_set.bits.len() {
-            new_set.bits[i] = self.bits[i] & !other.bits[i];
+        let mut new_set = self.matching_capacity();
+        new_set.grow(other.0.words());
+        for i in 0..new_set.0.words() {
+            *new_set.0.word_mut(i) = self.0.word(i) & !other.0.word(i);
         }
 
         new_set
     }
 
+    /// Create a new set without the given symbol
+    pub fn minus(&self, symbol: Symbol) -> SymbolSet {
+        let mut new_set = self.clone();
+        new_set.remove(symbol);
+
+        new_set
+    }
+
     pub fn intersection(&self, other: &SymbolSet) -> SymbolSet {
-        let mut new_set = SymbolSet::new(self.domain_size);
-        for i in 0..new_set.bits.len() {
-            new_set.bits[i] = self.bits[i] & other.bits[i];
+        let mut new_set = self.matching_capacity();
+        for i in 0..new_set.0.words() {
+            *new_set.0.word_mut(i) = self.0.word(i) & other.0.word(i);
         }
 
         new_set
     }
 
     pub fn union(&self, other: &SymbolSet) -> SymbolSet {
-        let mut new_set = SymbolSet::new(self.domain_size);
-        for i in 0..new_set.bits.len() {
-            new_set.bits[i] = self.bits[i] | other.bits[i];
+        let mut new_set = self.matching_capacity();
+        new_set.grow(other.0.words());
+        for i in 0..new_set.0.words() {
+            *new_set.0.word_mut(i) = self.0.word(i) | other.0.word(i);
         }
 
         new_set
     }
 
-    pub fn is_subset(&self, other: &SymbolSet) -> bool {
-        for i in 0..self.bits.len() {
-            if self.bits[i] & !other.bits[i] > 0 {
-                return false;
-            }
-        }
-        return true;
+    /// Create a new set with the given symbol added
+    pub fn plus(&self, symbol: Symbol) -> SymbolSet {
+        let mut new_set = self.clone();
+        new_set.insert(symbol);
+
+        new_set
     }
-    pub fn is_superset(&self, other: &SymbolSet) -> bool {
-        for i in 0..self.bits.len() {
-            if other.bits[i] & !self.bits[i] > 0 {
+
+    /// non-strict subset
+    /// no bits are set in self that aren't set in other
+    pub fn is_subset(&self, other: &SymbolSet) -> bool {
+        for i in 0..self.0.words() {
+            if self.0.word(i) & !other.0.word(i) != 0 {
                 return false;
             }
         }
-        return true;
+
+        true
+    }
+
+    /// non-strict superset
+    /// no bits are set in other that aren't set in self
+    pub fn is_superset(&self, other: &SymbolSet) -> bool {
+        other.is_subset(self)
     }
 
     pub fn iter(&self, domain: &SymbolDomain) -> impl Iterator<Item = Symbol> {
-        let mut id = 0;
-
-        std::iter::from_fn(move || {
-            // Skip ids that are not in the set
-            while id < self.len && !self.contains_id(id as u32) {
-                id += 1;
-            }
-
-            let symbol = (id < self.len).then(|| domain.symbols[id]);
-            id += 1;
-            symbol
-        })
-    }
-}
-
-impl<'a> std::ops::Sub for &SymbolSet {
-    type Output = SymbolSet;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        self.difference(&rhs)
-    }
-}
-
-impl<'a> std::ops::BitOr for &SymbolSet {
-    type Output = SymbolSet;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        self.union(rhs)
-    }
-}
-
-impl<'a> std::ops::BitAnd for &SymbolSet {
-    type Output = SymbolSet;
-
-    fn bitand(self, rhs: Self) -> Self::Output {
-        self.intersection(rhs)
+        (0..domain.len)
+            .filter(move |&id| self.contains_id(id as u32))
+            .map(move |id| domain.symbols[id])
     }
 }
